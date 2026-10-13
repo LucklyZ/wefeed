@@ -23,40 +23,60 @@ if (!fs.existsSync(ARTICLES_DIR)) {
 }
 
 let debounceTimer = null
+let retryTimer = null
 let pendingFiles = new Set()
+const RETRY_MS = 5 * 60 * 1000 // push 失败后 5 分钟重试
 
 function log(msg) {
   const ts = new Date().toLocaleString('zh-CN', { hour12: false })
   console.log(`[${ts}] ${msg}`)
 }
 
-function gitPush() {
+function scheduleRetry() {
+  if (retryTimer) return
+  retryTimer = setTimeout(() => {
+    retryTimer = null
+    log('重试 git push ...')
+    gitPush(true)
+  }, RETRY_MS)
+  log('git 操作失败，将在 5 分钟后自动重试')
+}
+
+function gitPush(isRetry = false) {
   const files = [...pendingFiles]
   pendingFiles.clear()
 
-  log(`检测到变化的文件:\n  ${files.join('\n  ')}`)
-  log('开始执行 git add / commit / push ...')
+  if (files.length > 0) {
+    log(`检测到变化的文件:\n  ${files.join('\n  ')}`)
+  }
+  log(isRetry ? '开始重试 git push ...' : '开始执行 git add / commit / push ...')
 
   try {
-    // 检查是否有可提交的内容
-    const status = execSync('git status --porcelain', { cwd: REPO_ROOT }).toString().trim()
-    if (!status) {
-      log('没有需要提交的变更，跳过 push')
-      return
+    // 只处理文章目录，避免扫描 .wrangler 等无关目录产生权限警告。
+    const status = execSync('git status --porcelain -- articles', { cwd: REPO_ROOT }).toString().trim()
+    if (status) {
+      const now = new Date().toLocaleString('zh-CN', { hour12: false })
+      execSync('git add -- articles', { cwd: REPO_ROOT, stdio: 'inherit' })
+      execSync(`git commit -m "auto: update articles ${now}"`, { cwd: REPO_ROOT, stdio: 'inherit' })
     }
 
-    const now = new Date().toLocaleString('zh-CN', { hour12: false })
-    execSync('git add .', { cwd: REPO_ROOT, stdio: 'inherit' })
-    execSync(`git commit -m "auto: update articles ${now}"`, { cwd: REPO_ROOT, stdio: 'inherit' })
-    execSync('git push', { cwd: REPO_ROOT, stdio: 'inherit' })
+    // 即使没有新的未提交文件，也要推送此前提交但尚未同步到远程的 commit。
+    execSync('git push origin HEAD', { cwd: REPO_ROOT, stdio: 'inherit' })
     log('push 成功，Cloudflare Pages 将自动触发构建')
   } catch (err) {
     console.error('[watcher] git 操作失败:', err.message)
+    scheduleRetry()
   }
 }
 
 function schedulePush(filePath) {
   pendingFiles.add(filePath)
+
+  // 新变更到来时，让正常防抖流程优先于旧的重试定时器。
+  if (retryTimer) {
+    clearTimeout(retryTimer)
+    retryTimer = null
+  }
 
   if (debounceTimer) {
     clearTimeout(debounceTimer)
